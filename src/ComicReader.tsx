@@ -9,14 +9,61 @@ type ComicPage = { name: string; url: string; source: "image" | "pdf" | "cbz"; p
 type PdfDoc = { numPages: number; getPage: (n: number) => Promise<any> };
 declare global { interface Window { Tesseract?: any; pdfjsLib?: any; JSZip?: any } }
 
+const CDN = {
+  tesseract: "https://cdn.jsdelivr.net/npm/tesseract.js@5/dist/tesseract.min.js",
+  pdfjs: "https://cdnjs.cloudflare.com/ajax/libs/pdf.js/3.11.174/pdf.min.js",
+  pdfWorker: "https://cdnjs.cloudflare.com/ajax/libs/pdf.js/3.11.174/pdf.worker.min.js",
+  jszip: "https://cdnjs.cloudflare.com/ajax/libs/jszip/3.10.1/jszip.min.js",
+};
+
+const IMAGE_EXT = /\.(png|jpe?g|webp|gif|bmp|avif)$/i;
+const MIME: Record<string, string> = {
+  png: "image/png", jpg: "image/jpeg", jpeg: "image/jpeg", webp: "image/webp",
+  gif: "image/gif", bmp: "image/bmp", avif: "image/avif",
+};
 
 function loadScript(src: string) {
   return new Promise<void>((resolve, reject) => {
     const found = document.querySelector(`script[data-reader-src="${src}"]`) as HTMLScriptElement | null;
-    if (found) { if (found.dataset.loaded === "yes") resolve(); else { found.addEventListener("load", () => resolve(), { once: true }); found.addEventListener("error", () => reject(new Error("Library failed to load")), { once: true }); } return; }
-    const script = document.createElement("script"); script.src = src; script.async = true; script.dataset.readerSrc = src;
-    script.onload = () => { script.dataset.loaded = "yes"; resolve(); }; script.onerror = () => reject(new Error("Library failed to load")); document.head.appendChild(script);
+    if (found) {
+      if (found.dataset.loaded === "yes") resolve();
+      else {
+        found.addEventListener("load", () => resolve(), { once: true });
+        found.addEventListener("error", () => reject(new Error("Library failed to load")), { once: true });
+      }
+      return;
+    }
+    const script = document.createElement("script");
+    script.src = src; script.async = true; script.dataset.readerSrc = src;
+    script.onload = () => { script.dataset.loaded = "yes"; resolve(); };
+    script.onerror = () => reject(new Error("Library failed to load"));
+    document.head.appendChild(script);
   });
+}
+
+const naturalSort = (a: string, b: string) =>
+  a.localeCompare(b, undefined, { numeric: true, sensitivity: "base" });
+
+/** Burmese OCR often inserts spaces between letters; remove those and tidy blank lines. */
+function cleanBurmese(raw: string) {
+  return raw
+    .replace(/([á€€-á‚Ÿ])[ \t]+(?=[á€€-á‚Ÿ])/g, "$1")
+    .replace(/[ \t]+\n/g, "\n")
+    .replace(/\n{3,}/g, "\n\n")
+    .trim();
+}
+
+/** Split text into short chunks so speech synthesis does not stall on long input. */
+function toChunks(text: string, max = 180) {
+  const parts = text.split(/(?<=[á‹.!?\n])/).map((s) => s.trim()).filter(Boolean);
+  const out: string[] = [];
+  let cur = "";
+  for (const p of parts) {
+    if (cur && (cur + " " + p).length > max) { out.push(cur); cur = p; }
+    else cur = cur ? cur + " " + p : p;
+  }
+  if (cur) out.push(cur);
+  return out;
 }
 
 function ComicReader() {
@@ -24,143 +71,452 @@ function ComicReader() {
   const [active, setActive] = useState(0);
   const [text, setText] = useState("");
   const [busy, setBusy] = useState(false);
-  const [progressÕÈZ®Ëkºwµçkz»§Â+a…æş
-Ş§ûZŠWè­û¥–‹­¦ëo8`%8`.¸`&x`+ĞÔˆ8`!x`%8`!x`.¸`&x`/¸`+8`(x`&x`/¸`+8`.8`%¸`/8`!x`.¸`%8`,x`%x`*ø`$8`&¸`.¸`bÈ[\›™]8` 8`+x`+ø`!x`!x`.¸`%x`/8`+¸`.8`%x`/8`%8`.¸`!x`&x`.¸`.8`%x`*ø`bÈŠNÂˆKˆJNÂˆÛÜšÙ\”™Y‹˜İ\œ™[HÛÜšÙ\Âˆ™]\›ˆÛÜšÙ\ÂˆJJ
-K˜Ø]Ú
+  const [progress, setProgress] = useState<number | null>(null);
+  const [status, setStatus] = useState("á€–á€­á€¯á€„á€ºá€›á€½á€±á€¸á€•á€¼á€®á€¸ á€…á€á€„á€ºá€•á€«");
+  const [playing, setPlaying] = useState(false);
+  const [paused, setPaused] = useState(false);
+  const [autoNext, setAutoNext] = useState(true);
+  const [showVoice, setShowVoice] = useState(false);
+  const [showHelp, setShowHelp] = useState(false);
+  const [voices, setVoices] = useState<SpeechSynthesisVoice[]>([]);
+  const [voiceURI, setVoiceURI] = useState("");
 
-\œ›ÜŠHOˆÂˆÛÜšÙ\”›ÛZ\ÙT™Y‹˜İ\œ™[H[Âˆ›İÈ\œ›ÜÂˆJNÂˆ™]\›ˆÛÜšÙ\”›ÛZ\ÙT™Y‹˜İ\œ™[ÂˆK×JNÂ‚ˆ\ÙQY™™Xİ
+  const fileRef = useRef<HTMLInputElement>(null);
+  const pagesRef = useRef<ComicPage[]>([]);
+  const activeRef = useRef(0);
+  const textRef = useRef("");
+  const autoNextRef = useRef(true);
+  const playingRef = useRef(false);
+  const voiceRef = useRef("");
+  const ocrCache = useRef<Map<number, string>>(new Map());
+  const urlsRef = useRef<string[]>([]);
 
+  useEffect(() => { pagesRef.current = pages; }, [pages]);
+  useEffect(() => { activeRef.current = active; }, [active]);
+  useEffect(() => { textRef.current = text; }, [text]);
+  useEffect(() => { autoNextRef.current = autoNext; }, [autoNext]);
+  useEffect(() => { voiceRef.current = voiceURI; }, [voiceURI]);
 
-HOˆÂˆ][İ[YHYNÂˆÙ]ÛÜšÙ\Š
-K[Š
+  // Voices
+  useEffect(() => {
+    if (!("speechSynthesis" in window)) return;
+    const load = () => {
+      const list = window.speechSynthesis.getVoices();
+      setVoices(list);
+      setVoiceURI((cur) => {
+        if (cur && list.some((v) => v.voiceURI === cur)) return cur;
+        const my = list.find((v) => v.lang.toLowerCase().startsWith("my"));
+        return my ? my.voiceURI : "";
+      });
+    };
+    load();
+    window.speechSynthesis.addEventListener("voiceschanged", load);
+    return () => window.speechSynthesis.removeEventListener("voiceschanged", load);
+  }, []);
 
-HOˆÂˆYˆ
-[İ[Y
-HÈÙ]›ÙÜ™\ÜÊL
-NÈÙ]İ]\Ê¸`&x`/8`%8`.¸`&x`+ĞÔˆ8`!x`%8`!x`.ˆ8`(x`!¸`!8`.¸`'¸`!8`-ø`.¸`%¸`/8`!x`.¸`%x`*ø`%x`/8`+¸`bÈÛÛZXÈ8`%x`+ø`-¸`&ø`/x`,x`.8`%x`/8`+¸`.8` x`.ø` 8`.¸` x`.ø`!8`.¸`.8`%¸`$8`.¸`%8`+x`+ø`!8`.¸`%x`*ø`%x`/8`+¸`bÈŠNÈBˆJK˜Ø]Ú
+  // Show cached OCR text when the page changes
+  useEffect(() => { setText(ocrCache.current.get(active) ?? ""); }, [active]);
 
-\œ›ÜŠHOˆÂˆYˆ
-[İ[Y
-HÙ]İ]\Ê\œ›Üˆ[œİ[˜Ù[Ùˆ\œ›ÜˆÈĞÔˆ8`!x`%8`!x`.¸`%¸`/x`!8`-ø`.¸`&x`&ø`%x`*Îˆ	Ù\œ›Ü‹›Y\ÜØYÙ_Xˆ“ĞÔˆ8`!x`%8`!x`.¸`%¸`/x`!8`-ø`.¸`&x`&ø`%x`*ø`bÈ[\›™]8` 8`+x`+ø`!x`!x`.¸`%x`*ø`bÈŠNÂˆJNÂˆ™]\›ˆ
+  // Cleanup
+  useEffect(() => () => {
+    playingRef.current = false;
+    try { window.speechSynthesis?.cancel(); } catch { /* ignore */ }
+    urlsRef.current.forEach((u) => URL.revokeObjectURL(u));
+  }, []);
 
-HOˆÈ[İ[YH˜[ÙNÈNÂˆKÙÙ]ÛÜšÙ\—JNÂ‚ˆÛÛœİ™XÛÙÛš^™TYÙHH\ÙPØ[˜XÚÊ\Ş[˜È
-[™^ˆ[X™\‹ÜXZĞY\ˆH˜[ÙJHOˆÂˆÛÛœİYÙHHYÙ\Ô™Y‹˜İ\œ™[Ú[™^NÈYˆ
-\YÙJH™]\›ÂˆÙ]\ŞJYJNÈÙ]›ÙÜ™\ÜÊ
-NÈÙ]İ]\Ê¸`%x`+ø`-¸`$x`,¸` 8`!x`+8`'¸`+8`.8`$8`/x`,x` 8`+x`+È8`%¸`$8`.¸`$x`+ø`$8`.¸`%8`,x`%x`*ø`$8`&¸`.‹‹‹ˆŠNÂˆHÂˆÛÛœİÛÜšÙ\ˆH]ØZ]Ù]ÛÜšÙ\Š
-NÈÛÛœİ™\İ[H]ØZ]ÛÜšÙ\‹œ™XÛÙÛš^™JYÙK\›
-NÂˆÛÛœİ^˜XİYHİš[™Ê™\İ[™]K^ˆŠKš[J
-NÂˆÙ]^
-^˜XİY
-NÂˆÙ]İ]\Ê^˜XİYÈ¸`!x`+8`'¸`+8`.8`%¸`$8`.¸`$x`+ø`$8`.¸`%x`/8`+¸`.8`%x`*ø`%x`/8`+¸`bÈ8`'8`+x`+ø`(x`%x`.¸`&ø`!8`.ˆ8`%x`/8`!8`.¸`!¸`!8`.¸`%8`+x`+ø`!8`.¸`%x`*ø`$8`&¸`.ˆˆˆ¸`!x`+8`'¸`+8`.8`&x`$8`/x`,x`-ø`%x`*ø`bÈ8`%x`+ø`-¸` 8`/8`"¸`.¸`'8`!8`.¸`&x`/¸`+ø` 8`+x`+È8`!x`!x`.¸`%x`*ÈŠNÂˆYˆ
-ÜXZĞY\ˆ	‰ˆ^˜XİY
-HÚ[™İËœÙ][Y[İ]
+  const hasBurmeseVoice = useMemo(
+    () => voices.some((v) => v.lang.toLowerCase().startsWith("my")), [voices],
+  );
 
+  const stopSpeaking = useCallback(() => {
+    playingRef.current = false;
+    setPlaying(false);
+    setPaused(false);
+    try { window.speechSynthesis.cancel(); } catch { /* ignore */ }
+  }, []);
 
-HOˆÜXZÕ^
-^˜XİY
-KML
-NÂˆHØ]Ú
-\œ›ÜŠHÈÙ]İ]\Ê\œ›Üˆ[œİ[˜Ù[Ùˆ\œ›ÜˆÈ\œ›Ü‹›Y\ÜØYÙHˆ“ĞÔˆ8`&x`(x`,x`+8`!8`.¸`&x`/8`!8`.¸`%x`*ÈŠNÈBˆš[˜[HÈÙ]\ŞJ˜[ÙJNÈBˆKÙÙ]ÛÜšÙ\—JNÂ‚ˆÛÛœİÜXZÕ^H\ÙPØ[˜XÚÊ
-˜[YNˆİš[™ÊHOˆÂˆYˆ
-JœÜYXÚŞ[\Ú\Èˆ[ˆÚ[™İÊJHÈÙ]İ]\Ê¸`$¸`+ˆœ›İÜÙ\ˆ8`&x`/¸`+8`(x`'¸`-¸`%¸`$8`.¸`!x`%8`!x`.ˆ8`&x`&ø`&ø`/¸`+x`%x`*ÈŠNÈ™]\›ÈBˆÛÛœİÛX[ˆH˜[YKš[J
-NÈYˆ
-XÛX[ŠHÈÙ]İ]\Ê¸`%¸`$8`.¸`&ø`%8`.ˆ8`!x`+8`'¸`+8`.8`&x`&ø`/¸`+x`'¸`,x`.8`%x`*ÈŠNÈ™]\›ÈBˆÚ[™İËœÜYXÚŞ[\Ú\Ë˜Ø[˜Ù[
+  const resetPages = () => {
+    stopSpeaking();
+    urlsRef.current.forEach((u) => URL.revokeObjectURL(u));
+    urlsRef.current = [];
+    ocrCache.current.clear();
+    setPages([]); setActive(0); setText("");
+  };
 
-NÈÛÛœİ]\˜[˜ÙHH™]ÈÜYXÚŞ[\Ú\Õ]\˜[˜ÙJÛX[ŠNÂˆÛÛœİØ[™Y]\ÈH›ÚXÙ\Ë™š[\Š
-›ÚXÙJHOˆÛ^_\›KÚK\İ
-	İ›ÚXÙK›[™ßH	İ›ÚXÙK›˜[Y_X
-JNÂˆÛÛœİÙ[XİYH›ÚXÙ\Ë™š[™
+  const track = (blob: Blob) => {
+    const url = URL.createObjectURL(blob);
+    urlsRef.current.push(url);
+    return url;
+  };
 
-›ÚXÙJHOˆ›ÚXÙK›˜[YHOOH›ÚXÙS˜[YJHØ[™Y]\ÖÌNÂˆYˆ
-Ù[XİY
-HÈ]\˜[˜ÙK›ÚXÙHHÙ[XİYÈ]\˜[˜ÙK›[™ÈHÙ[XİY›[™ÎÈH[ÙH]\˜[˜ÙK›[™ÈH›^KSSHÂˆ]\˜[˜ÙKœ˜]HHÈ]\˜[˜ÙKœ]ÚHKŒÂˆ]\˜[˜ÙK›Ûœİ\H
+  const loadImages = (files: File[]): ComicPage[] =>
+    files.sort((a, b) => naturalSort(a.name, b.name))
+      .map((f) => ({ name: f.name, url: track(f), source: "image" as const }));
 
-HOˆÈÙ]ÜXZÚ[™ÊYJNÈÙ]]\ÙY
-˜[ÙJNÈÙ]İ]\Ê¸`&x`/8`%8`.¸`&x`+8`(x`'¸`-¸`%8`,¸`-È8`%¸`$8`.¸`%x`/8`%8`,x`%x`*ø`$8`&¸`.‹‹‹ˆŠNÈNÂˆ]\˜[˜ÙK›Û™[™H
+  const loadCbz = async (file: File): Promise<ComicPage[]> => {
+    setStatus("CBZ library á€á€±á€«á€ºá€”á€±á€á€Šá€ºâ€¦");
+    if (!window.JSZip) await loadScript(CDN.jszip);
+    const zip = await window.JSZip.loadAsync(file);
+    const names = Object.keys(zip.files)
+      .filter((n: string) => !zip.files[n].dir && IMAGE_EXT.test(n) && !n.includes("__MACOSX"))
+      .sort(naturalSort);
+    const out: ComicPage[] = [];
+    for (let i = 0; i < names.length; i++) {
+      setStatus(`CBZ á€–á€á€ºá€”á€±á€á€Šá€º ${i + 1}/${names.length}`);
+      setProgress(Math.round(((i + 1) / names.length) * 100));
+      const ext = names[i].split(".").pop()!.toLowerCase();
+      const buf = await zip.files[names[i]].async("arraybuffer");
+      const url = track(new Blob([buf], { type: MIME[ext] || "image/jpeg" }));
+      out.push({ name: names[i].split("/").pop() || names[i], url, source: "cbz" });
+    }
+    return out;
+  };
 
-HOˆÈÙ]ÜXZÚ[™Ê˜[ÙJNÈÙ]]\ÙY
-˜[ÙJNÈYˆ
-]]Ô™Y‹˜İ\œ™[	‰ˆXİ]™T™Y‹˜İ\œ™[YÙ\Ô™Y‹˜İ\œ™[›[™İHJHÈÛÛœİ™^HXİ]™T™Y‹˜İ\œ™[
-ÈNÈÙ]Xİ]™J™^
-NÈÚ[™İËœÙ][Y[İ]
+  const loadPdf = async (file: File): Promise<ComicPage[]> => {
+    setStatus("PDF library á€á€±á€«á€ºá€”á€±á€á€Šá€ºâ€¦");
+    if (!window.pdfjsLib) {
+      await loadScript(CDN.pdfjs);
+      window.pdfjsLib.GlobalWorkerOptions.workerSrc = CDN.pdfWorker;
+    }
+    const data = await file.arrayBuffer();
+    const doc: PdfDoc = await window.pdfjsLib.getDocument({ data }).promise;
+    const out: ComicPage[] = [];
+    for (let n = 1; n <= doc.numPages; n++) {
+      setStatus(`PDF á€…á€¬á€™á€»á€€á€ºá€”á€¾á€¬ ${n}/${doc.numPages} á€•á€¼á€±á€¬á€„á€ºá€¸á€”á€±á€á€Šá€º`);
+      setProgress(Math.round((n / doc.numPages) * 100));
+      const page = await doc.getPage(n);
+      const viewport = page.getViewport({ scale: 1.6 });
+      const canvas = document.createElement("canvas");
+      canvas.width = viewport.width; canvas.height = viewport.height;
+      await page.render({ canvasContext: canvas.getContext("2d"), viewport }).promise;
+      const blob: Blob | null = await new Promise((r) => canvas.toBlob(r, "image/jpeg", 0.88));
+      if (blob) out.push({ name: `${file.name} Â· ${n}`, url: track(blob), source: "pdf", pageNo: n });
+    }
+    return out;
+  };
 
+  const onFiles = async (list: FileList | null) => {
+    if (!list || !list.length) return;
+    const files = Array.from(list);
+    resetPages();
+    setBusy(true); setProgress(0);
+    try {
+      let result: ComicPage[] = [];
+      const images = files.filter((f) => f.type.startsWith("image/") || IMAGE_EXT.test(f.name));
+      const pdf = files.find((f) => /\.pdf$/i.test(f.name) || f.type === "application/pdf");
+      const cbz = files.find((f) => /\.(cbz|zip)$/i.test(f.name));
+      if (images.length) result = loadImages(images);
+      else if (pdf) result = await loadPdf(pdf);
+      else if (cbz) result = await loadCbz(cbz);
+      if (!result.length) {
+        setStatus("á€‘á€±á€¬á€€á€ºá€•á€¶á€·á€á€²á€· á€–á€­á€¯á€„á€º á€™á€á€½á€±á€·á€•á€« (á€•á€¯á€¶áŠ PDFáŠ CBZ á€á€¯á€¶á€¸á€”á€­á€¯á€„á€ºá€á€Šá€º)");
+      } else {
+        setPages(result); setActive(0);
+        setStatus(`á€…á€¬á€™á€»á€€á€ºá€”á€¾á€¬ ${result.length} á€á€¯ á€–á€½á€„á€·á€ºá€•á€¼á€®á€¸á€•á€«á€•á€¼á€®`);
+      }
+    } catch (e: any) {
+      setStatus(`á€–á€­á€¯á€„á€ºá€–á€½á€„á€·á€ºá€™á€›á€•á€«: ${e?.message || "á€™á€á€­á€á€±á€¬ á€¡á€™á€¾á€¬á€¸"}`);
+    } finally {
+      setBusy(false); setProgress(null);
+      if (fileRef.current) fileRef.current.value = "";
+    }
+  };
 
-HOˆ™XÛÙÛš^™TYÙJ™^YJKÍL
-NÈH[ÙHÙ]İ]\Ê¸`%¸`$8`.¸`%x`/8`+¸`.8`%x`*ø`%x`/8`+ˆŠNÈNÂˆ]\˜[˜ÙK›Û™\œ›ÜˆH
+  const runOcr = useCallback(async (index: number): Promise<string> => {
+    const cached = ocrCache.current.get(index);
+    if (cached !== undefined) return cached;
+    const page = pagesRef.current[index];
+    if (!page) return "";
+    setBusy(true); setProgress(0);
+    setStatus(`á€…á€¬á€™á€»á€€á€ºá€”á€¾á€¬ ${index + 1} á€€á€­á€¯ OCR á€œá€¯á€•á€ºá€”á€±á€á€Šá€ºâ€¦`);
+    try {
+      if (!window.Tesseract) await loadScript(CDN.tesseract);
+      const res = await window.Tesseract.recognize(page.url, "mya+eng", {
+        logger: (m: any) => {
+          if (m.status === "recognizing text") setProgress(Math.round(m.progress * 100));
+          else if (m.status) setStatus(`OCR: ${m.status}`);
+        },
+      });
+      const clean = cleanBurmese(res?.data?.text || "");
+      ocrCache.current.set(index, clean);
+      if (activeRef.current === index) setText(clean);
+      setStatus(clean ? `á€…á€¬á€™á€»á€€á€ºá€”á€¾á€¬ ${index + 1} á€…á€¬á€á€¬á€¸ á€‘á€¯á€á€ºá€•á€¼á€®á€¸á€•á€«á€•á€¼á€®` : "á€…á€¬á€á€¬á€¸ á€™á€á€½á€±á€·á€•á€«");
+      return clean;
+    } catch (e: any) {
+      setStatus(`OCR á€™á€¡á€±á€¬á€„á€ºá€™á€¼á€„á€ºá€•á€«: ${e?.message || "á€¡á€„á€ºá€á€¬á€”á€€á€ºá€…á€…á€ºá€•á€«"}`);
+      return "";
+    } finally {
+      setBusy(false); setProgress(null);
+    }
+  }, []);
 
-HOˆÈÙ]ÜXZÚ[™Ê˜[ÙJNÈÙ]]\ÙY
-˜[ÙJNÈÙ]İ]\Ê¸`(x`'¸`-¸`%¸`$8`.¸`&x`&ø`%x`*ø`bÈ8`%¸`+ø`%8`.¸`.8`&ø`,¸`-È^]ËTÜYXÚ8`(x`'¸`-¸` 8`+x`+È8`!x`!x`.¸`%x`*ÈŠNÈNÂˆÚ[™İËœÜYXÚŞ[\Ú\ËœÜXZÊ]\˜[˜ÙJNÂˆKİ›ÚXÙ\Ë›ÚXÙS˜[YK™XÛÙÛš^™TYÙWJNÂ‚ˆÛÛœİİÜÜYXÚH
+  const speak = (content: string) =>
+    new Promise<void>((resolve) => {
+      const chunks = toChunks(content);
+      let i = 0;
+      const next = () => {
+        if (!playingRef.current || i >= chunks.length) return resolve();
+        const u = new SpeechSynthesisUtterance(chunks[i++]);
+        const voice = window.speechSynthesis.getVoices().find((v) => v.voiceURI === voiceRef.current);
+        if (voice) { u.voice = voice; u.lang = voice.lang; } else u.lang = "my-MM";
+        u.onend = next;
+        u.onerror = () => resolve();
+        window.speechSynthesis.speak(u);
+      };
+      next();
+    });
 
-HOˆÈÚ[™İËœÜYXÚŞ[\Ú\ÏË˜Ø[˜Ù[
+  const startReading = async () => {
+    if (!("speechSynthesis" in window)) { setStatus("á€’á€® browser á€™á€¾á€¬ á€¡á€á€¶á€–á€á€ºá€…á€”á€…á€º á€™á€•á€«á€•á€«"); return; }
+    if (playingRef.current) return;
+    window.speechSynthesis.cancel();
+    playingRef.current = true; setPlaying(true); setPaused(false);
+    let idx = activeRef.current;
+    let first = true;
+    while (playingRef.current) {
+      let t = first ? textRef.current : "";
+      first = false;
+      if (!t.trim()) {
+        activeRef.current = idx;
+        t = await runOcr(idx);
+        if (!playingRef.current) break;
+        if (activeRef.current === idx) setText(t);
+      }
+      if (t.trim()) {
+        setStatus(`á€…á€¬á€™á€»á€€á€ºá€”á€¾á€¬ ${idx + 1} á€€á€­á€¯ á€–á€á€ºá€”á€±á€á€Šá€ºâ€¦`);
+        await speak(t);
+      }
+      if (!playingRef.current) break;
+      if (autoNextRef.current && idx + 1 < pagesRef.current.length) {
+        idx += 1; setActive(idx);
+      } else break;
+    }
+    playingRef.current = false; setPlaying(false); setPaused(false);
+    setStatus("á€–á€á€ºá€•á€¼á€®á€¸á€•á€«á€•á€¼á€®");
+  };
 
-NÈÙ]ÜXZÚ[™Ê˜[ÙJNÈÙ]]\ÙY
-˜[ÙJNÈNÂˆÛÛœİÛÕÈH
-[™^ˆ[X™\ŠHOˆÈÛÛœİØY™HHX]›X^
-X]›Z[ŠYÙ\Ë›[™İHK[™^
-JNÈİÜÜYXÚ
+  const togglePause = () => {
+    if (!playing) { void startReading(); return; }
+    if (paused) { window.speechSynthesis.resume(); setPaused(false); }
+    else { window.speechSynthesis.pause(); setPaused(true); }
+  };
 
-NÈÙ]Xİ]™JØY™JNÈÙ]^
-ˆŠNÈÙ]İ]\Ê8`!x`+8`&x`.ø` 8`.¸`%8`/¸`+	ÜØY™H
-È_H8` 8`+x`+È8`%¸`/x`!8`-ø`.¸`$x`+8`.8`%x`*ø`$8`&¸`.˜
-NÈNÂˆÛÛœİYÙSX™[H\ÙSY[[Ê
+  const go = (delta: number) => {
+    const n = active + delta;
+    if (n < 0 || n >= pages.length) return;
+    if (playing) stopSpeaking();
+    setActive(n);
+  };
 
-HOˆYÙ\Ë›[™İÈ	ØXİ]™H
-È_HÈ	ÜYÙ\Ë›[™İXˆŒÈ‹ØXİ]™KYÙ\Ë›[™İJNÂ‚ˆ\ÙQY™™Xİ
+  const current = pages[active];
 
+  return (
+    <div className="reader-shell">
+      <header className="topbar">
+        <a className="brand" href="./">
+          <span className="brand-mark"><BookOpen size={19} /></span>
+          <span><b>MYANMAR AI</b><small>COMIC READER</small></span>
+        </a>
+        <div className="top-actions">
+          <span className="local-pill"><i />LOCAL ONLY</span>
+          <button className="icon-button" aria-label="á€¡á€€á€°á€¡á€Šá€®" onClick={() => setShowHelp(true)}>
+            <Sparkles size={16} />
+          </button>
+        </div>
+      </header>
 
-HOˆ
+      <section className="intro-row">
+        <div>
+          <span className="eyebrow">MYANMAR OCR Â· READ ALOUD</span>
+          <h1>Comic á€€á€­á€¯ <em>á€–á€á€ºá€•á€¼á€®á€¸</em><br />á€”á€¬á€¸á€‘á€±á€¬á€„á€ºá€•á€«</h1>
+          <p className="intro-copy">
+            MangaáŠ Webtoon á€–á€­á€¯á€„á€ºá€á€½á€±á€€á€­á€¯ á€–á€½á€„á€·á€ºá€•á€¼á€®á€¸ á€™á€¼á€”á€ºá€™á€¬á€…á€¬á€á€¬á€¸ á€‘á€¯á€á€ºá€šá€°á€€á€¬ á€¡á€á€¶á€”á€²á€· á€”á€¬á€¸á€‘á€±á€¬á€„á€ºá€”á€­á€¯á€„á€ºá€•á€«á€á€šá€ºá‹
+            á€–á€­á€¯á€„á€ºá€á€½á€±á€€ á€á€„á€·á€º browser á€‘á€²á€™á€¾á€¬á€•á€² á€›á€¾á€­á€”á€±á€•á€«á€á€šá€ºá‹
+          </p>
+        </div>
+        <div className="intro-art" aria-hidden="true">
+          <span className="art-orbit orbit-one" /><span className="art-orbit orbit-two" />
+          <div className="art-book"><FileImage size={34} /><span /></div>
+          <span className="art-spark spark-a">âœ¦</span><span className="art-spark spark-b">âœ§</span>
+        </div>
+      </section>
 
-HOˆÈÚ[™İËœÜYXÚŞ[\Ú\ÏË˜Ø[˜Ù[
+      <section className="upload-panel">
+        <div className="upload-icon"><UploadCloud size={22} /></div>
+        <div className="upload-copy">
+          <h2>Comic á€–á€­á€¯á€„á€º á€›á€½á€±á€¸á€•á€«</h2>
+          <p>á€•á€¯á€¶á€™á€»á€¬á€¸ (JPG/PNG/WebP)áŠ PDFáŠ CBZ/ZIP á€‘á€±á€¬á€€á€ºá€•á€¶á€·á€á€Šá€º</p>
+        </div>
+        <input
+          ref={fileRef} className="file-input" type="file" multiple
+          accept="image/*,.pdf,.cbz,.zip,application/pdf"
+          onChange={(e) => void onFiles(e.target.files)}
+        />
+        <button className="primary-button" disabled={busy} onClick={() => fileRef.current?.click()}>
+          <FolderOpen size={15} /> á€–á€­á€¯á€„á€ºá€›á€½á€±á€¸á€™á€Šá€º
+        </button>
+      </section>
 
-NÈYˆ
-ÛÜšÙ\”™Y‹˜İ\œ™[
-HÛÜšÙ\”™Y‹˜İ\œ™[\›Z[˜]J
-NÈ™[X\ÙTYÙ\ÊYÙ\Ô™Y‹˜İ\œ™[
-NÈKÜ™[X\ÙTYÙ\×JNÂ‚ˆ™]\›ˆ
-ˆXZ[ˆÛ\ÜÓ˜[YOHœ™XY\‹\Ú[‚ˆXY\ˆÛ\ÜÓ˜[YOHÜ˜\ˆ‚ˆHÛ\ÜÓ˜[YOH˜œ˜[™ˆ™YH‹Èˆ\šXK[X™[H“^X[›X\ˆRHÛÛZXÈ™XY\ˆÛYHÜ[ˆÛ\ÜÓ˜[YOH˜œ˜[™[X\šÈ›ÛÚÓÜ[ˆÚ^™O^ÌŒ_KÏÜÜ[Ü[“VPS“PTˆROØÛX[ÓÓRPÈ‘PQTÜÛX[ÜÜ[ØO‚ˆ]ˆÛ\ÜÓ˜[YOHÜXXİ[ÛœÈÜ[ˆÛ\ÜÓ˜[YOH›ØØ[\[KÏˆĞĞSÑTÔÒSÓÜÜ[]ÛˆÛ\ÜÓ˜[YOHšXÛÛ‹X]ÛˆˆÛÛXÚÏ^Ê
-HOˆÙ]ÚİÒ[
-YJ_H\šXK[X™[H¸`(x` 8`,8`(x`"¸`+ˆÜ\šÛ\ÈÚ^™O^ÌNKÏØ]ÛÙ]‚ˆÚXY\‚‚ˆÙXİ[ÛˆÛ\ÜÓ˜[YOHš[›Ë\›İÈ‚ˆ]Û\ÜÓ˜[YOH™^YXœ›İÈ–SÕTˆT”ÓÓSÕÔ–HÔPÑOÜO¸`&ø`+ø`%x`.¸`%x`/8`!ø`+8`$8`.¸`'8`&x`.¸`.8`$8`/x`,x` 8`+x`+Ïœ‹Ï[O¸`(x`'¸`-¸`%8`,¸`-È8`(x`'¸` 8`.¸`'¸`/x`!8`.¸`.8`%x`*ø`bÏÙ[OÚOÛ\ÜÓ˜[YOHš[›ËXÛÜH¸`%¸`+ø`%8`.¸`.8`$x`,¸` ÛÛZXÈ8` 8`+x`+È8`%¸`/x`!8`-ø`.¸`%x`*ø`bÈ8`&x`/8`%8`.¸`&x`+8`!x`+8`'¸`+8`.8`$8`/x`,H8`%¸`$8`.¸`$x`+ø`$8`.¸`%x`/8`+¸`.8`(x`'¸`-¸`%8`,¸`-È8`%8`+8`.8`$x`,x`+8`!8`.¸`'8`+x`+ø` 8`.¸`%x`*ø`bÏÜÙ]‚ˆ]ˆÛ\ÜÓ˜[YOHš[›ËX\ˆ\šXKZY[HYH]ˆÛ\ÜÓ˜[YOH˜\[Ü˜š]Ü˜š][Û™H‹Ï]ˆÛ\ÜÓ˜[YOH˜\[Ü˜š]Ü˜š]]ÛÈ‹Ï]ˆÛ\ÜÓ˜[YOH˜\X›ÛÚÈ›ÛÚÓÜ[ˆÚ^™O^ÍŒŸKÏÜ[‹ÏÙ]]ˆÛ\ÜÓ˜[YOH˜\\Ü\šÈÜ\šËXH¸§)Ù]]ˆÛ\ÜÓ˜[YOH˜\\Ü\šÈÜ\šËXˆ¸§)ÏÙ]Ù]‚ˆÜÙXİ[Û‚‚ˆÙXİ[ÛˆÛ\ÜÓ˜[YOH\ØY\[™[‚ˆ]ˆÛ\ÜÓ˜[YOH\ØYZXÛÛˆ\ØYÛİYÚ^™O^ÌKÏÙ]]ˆÛ\ÜÓ˜[YOH\ØYXÛÜH¸` 8`+x`+ø`&¸`-ø`.ˆÛÛZXÈ8`%¸`+x`+ø`!8`.¸` 8`+x`+È8`&ø`/x`,x`.8`%x`*ÏÚ’”Ë‘ËÙX”‹Ğ–ˆ8`%¸`+x`+ø`!8`.¸`&x`.ø`+8`.8` 8`+x`+È8`%x`-¸`-ø`%x`+x`+ø`.8`%x`*ø`$8`&¸`.¸`bÏÜÙ]‚ˆ]ÛˆÛ\ÜÓ˜[YOHœš[X\KX]ÛˆˆÛÛXÚÏ^Ê
-HOˆ[œ]™Y‹˜İ\œ™[Ë˜ÛXÚÊ
-_H\ØX›Y^Ø\Ş_O›Û\“Ü[ˆÚ^™O^ÌMßKÏˆ8`%¸`+x`+ø`!8`.¸`&ø`/x`,x`.8`&x`&¸`.Ø]Û‚ˆ[œ]™Y^Ú[œ]™YŸHÛ\ÜÓ˜[YOH™š[KZ[œ]ˆ\OH™š[HˆXØÙ\Hš[XYÙKÊ‹œ‹˜Ø‹š\ˆ][\HÛÚ[™ÙO^Ê]™[
-HOˆ]™[\™Ù]™š[\È	‰ˆ™XYš[\Ê]™[\™Ù]™š[\Ê_KÏ‚ˆÜÙXİ[Û‚‚ˆ]ˆÛ\ÜÓ˜[YOHœİ]\Ë[[™Hˆ›ÛOHœİ]\ÈÜ[ˆÛ\ÜÓ˜[YO^Ø\ŞHÈœİ]\ËYİÛÜšÚ[™Èˆˆœİ]\ËYİŸKÏÜİ]\ß^Ø\ŞH	‰ˆÜ[ˆÛ\ÜÓ˜[YOHœ›ÙÜ™\ÜË]˜[YHÜ›ÙÜ™\ÜßIOÜÜ[ŸOÙ]‚‚ˆÙXİ[ÛˆÛ\ÜÓ˜[YOHÛÜšÜÜXÙH‚ˆ]ˆÛ\ÜÓ˜[YOHœYÙK\[™[‚ˆ]ˆÛ\ÜÓ˜[YOHœ[™[ZXY[™È]Ü[ˆÛ\ÜÓ˜[YOHœÙXİ[Û‹ZÚXÚÙ\ˆ•H‘PQS‘È“ÓÓOÜÜ[¸`!x`+8`&x`.ø` 8`.¸`%8`/¸`+8` 8`/8`"¸`-ø`.¸`&ø`%8`.ÚÙ]Ü[ˆÛ\ÜÓ˜[YOHœYÙKXÛİ[ÜYÙSX™[OÜÜ[Ù]‚ˆ]ˆÛ\ÜÓ˜[YO^ØÛÛZXË\İYÙH	Øİ\œ™[Èš\Ë\YÙHˆˆˆŸXO‚ˆØİ\œ™[È[YÈÜ˜Ï^Øİ\œ™[\›H[^Øİ\œ™[›˜[Y_KÏˆˆ]ˆÛ\ÜÓ˜[YOH™[\K\YÙH]ˆÛ\ÜÓ˜[YOH™[\KX›ÛÚÈ›ÛÚÓÜ[ˆÚ^™O^ÍKÏÙ]¸`!ø`+8`$8`.¸`'8`&x`.¸`.8`$8`!x`.¸`%x`+ø`$¸`.ˆ8`!x`$8`!8`.¸`'8`+x`+ø` 8`.¸`%x`*ÏØÜ[ÛÛZXÈ8`%¸`+x`+ø`!8`.¸`&ø`/x`,x`.8`%x`/8`+¸`.8`!x`+8`&x`.ø` 8`.¸`%8`/¸`+8`$8`/x`,x` 8`+x`+È8`$¸`+¸`%8`,x`&ø`+8`&x`/¸`+8` 8`/8`"¸`-ø`.¸`%8`+x`+ø`!8`.¸`%x`*ø`$8`&¸`.¸`bÏÜÜ[]ÛˆÛÛXÚÏ^Ê
-HOˆ[œ]™Y‹˜İ\œ™[Ë˜ÛXÚÊ
-_Oš[R[XYÙHÚ^™O^ÌMŸKÏˆ8`%x`+ø`-ˆ8`'¸`+x`+ø`-ø`&x`'ø`+ø`$8`.ˆ8`%¸`+x`+ø`!8`.¸`&ø`/x`,x`.8`&ø`%8`.Ø]ÛÙ]ŸBˆÙ]‚ˆ]ˆÛ\ÜÓ˜[YOHœYÙK]ÛÛ˜\ˆ]ÛˆÛ\ÜÓ˜[YOHœÙXÛÛ™\KX]ÛˆˆÛÛXÚÏ^Ê
-HOˆÛÕÊXİ]™HHJ_H\ØX›Y^È\YÙ\Ë›[™İXİ]™HOOHOÚ]œ›Û“YÚ^™O^ÌMßKÏˆ8`%8`,x`+8` 8`.¸`%x`/8`%8`.Ø]ÛÜ[Øİ\œ™[Ë›˜[YH“›ÈÛÛZXÈÙ[XİYŸOÜÜ[]ÛˆÛ\ÜÓ˜[YOHœÙXÛÛ™\KX]ÛˆˆÛÛXÚÏ^Ê
-HOˆÛÕÊXİ]™H
-ÈJ_H\ØX›Y^È\YÙ\Ë›[™İXİ]™HHYÙ\Ë›[™İH_O¸`&ø`/¸`,x`-ø`'¸`+x`+ø`-ÈÚ]œ›Û”šYÚÚ^™O^ÌMßKÏØ]ÛÙ]‚ˆÙ]‚‚ˆ\ÚYHÛ\ÜÓ˜[YOHœÜYXÚ\[™[‚ˆ]ˆÛ\ÜÓ˜[YOHœ[™[ZXY[™È]Ü[ˆÛ\ÜÓ˜[YOHœÙXİ[Û‹ZÚXÚÙ\ˆRHÕÔ–H“ÒPÑOÜÜ[¸`!x`+8`'¸`+8`.8`%8`/¸`!8`-ø`.ˆ8`(x`'¸`-ÚÙ]Ü[ˆÛ\ÜÓ˜[YOH›ÚXÙK[Ü˜ˆ›Û[YLˆÚ^™O^ÌMßKÏÜÜ[Ù]‚ˆ]ˆÛ\ÜÓ˜[YOH›ØÜ‹XXİ[Ûˆ]ØØ[•^Ú^™O^ÌNKÏÜ[¸`!x`+8`'¸`+8`.8`%¸`$8`.¸`$x`+ø`$8`.¸`&x`&¸`.ØÛX[¸`%x`+ø`-¸`$x`,¸` 8`&x`/8`%8`.¸`&x`+8`!x`+8` 8`+x`+ÈĞÔˆ8`%8`,¸`-È8`&ø`/¸`+8`%¸`/x`,x`&x`&¸`.ÜÛX[ÜÜ[Ù]]ÛˆÛÛXÚÏ^Ê
-HOˆ™XÛÙÛš^™TYÙJXİ]™J_H\ØX›Y^ÈXİ\œ™[\Ş_OÜ\šÛ\ÈÚ^™O^ÌM_KÏˆØ\ŞHÈ¸`'8`+ø`%x`.¸`!¸`,x`+8`!8`.¸`%8`,Hˆˆ¸`!x`$8`!8`.ˆŸOØ]ÛÙ]‚ˆX™[Û\ÜÓ˜[YOH^[X™[ˆ[›ÜH˜ÛÛZXË]^¸`%¸`$8`.¸`%x`/8`&x`&¸`-ø`.ˆ8`!x`+8`'¸`+8`.ÛX[¸`%x`/8`!8`.¸`!¸`!8`.¸`'8`+x`+ø`-ø`&ø`%x`*ø`$8`&¸`.ÜÛX[ÛX™[‚ˆ^\™XHYH˜ÛÛZXË]^ˆ˜[YO^İ^HÛÚ[™ÙO^Ê]™[
-HOˆÙ]^
-]™[\™Ù]˜[YJ_HXÙZÛ\H“ĞÔˆ8`%8`,¸`-È8`%¸`$8`.¸`$x`+ø`$8`.¸`$x`+8`.8`$8`,¸`-È8`!x`+8`'¸`+8`.8`$8`/x`,H8`$¸`+¸`%8`,x`&ø`+8`&x`/¸`+8`%x`,x`*ø`.¸`'8`+8`%x`*ø`&x`&¸`.¸`bÈ8`'8`+x`+ø`(x`%x`.¸`&ø`!8`.ˆ8` 8`+x`+ø`&¸`.¸`$8`+x`+ø`!8`.¸`'8`"¸`.¸`.8`&ø`,x`.8`$x`"¸`-ø`.¸`%8`+x`+ø`!8`.¸`%x`*ø`$8`&¸`.¸`bÈ‹Ï‚ˆ]ˆÛ\ÜÓ˜[YOH›ÚXÙK[Ü[ÛœÈX™[Û\ÜÓ˜[YOH˜]]Ë[™^[œ]\OH˜ÚXÚØ›ŞˆÚXÚÙY^Ø]]Ó™^HÛÚ[™ÙO^Ê]™[
-HOˆÙ]]]Ó™^
-]™[\™Ù]˜ÚXÚÙY
-_KÏÜ[ˆÛ\ÜÓ˜[YOH˜ÚXÚË]ZH‹ÏÜ[¸`%x`/8`+¸`.8`&ø`!8`.ˆ8`%8`,x`+8` 8`.¸`!x`+8`&x`.ø` 8`.¸`%8`/¸`+8` 8`+x`+È8`(x`'8`+x`+ø`(x`'8`.ø`,x`+8` 8`.¸`!¸` 8`.¸`%¸`$8`.¸`&x`&¸`.ÜÜ[ÛX™[]ÛˆÛ\ÜÓ˜[YOH›ÚXÙK\Ù][™ÜÈˆÛÛXÚÏ^Ê
-HOˆÙ]ÚİÕ›ÚXÙJ\ÚİÕ›ÚXÙJ_O›Û[YLˆÚ^™O^ÌMKÏˆ8`(x`'¸`-¸`&ø`/x`,x`.8`&ø`%8`.Ø]ÛÙ]‚ˆÜÚİÕ›ÚXÙH	‰ˆ]ˆÛ\ÜÓ˜[YOH›ÚXÙK\Ù[Xİ]Ü˜\X™[[›ÜH›ÚXÙK\Ù[Xİ¸`%¸`+ø`%8`.¸`.8`&x`/¸`+8`&ø`&ø`/¸`+x`%8`+x`+ø`!8`.¸`$8`,¸`-È8`(x`'¸`-ÛX™[Ù[XİYH›ÚXÙK\Ù[Xİˆ˜[YO^İ›ÚXÙS˜[Y_HÛÚ[™ÙO^Ê]™[
-HOˆÙ]›ÚXÙS˜[YJ]™[\™Ù]˜[YJ_OÜ[Ûˆ˜[YOHˆ¸`&x`/8`%8`.¸`&x`+8`(x`'¸`-¸` 8`+x`+È8`(x`'8`+x`+ø`(x`'8`.ø`,x`+8` 8`.¸`&ø`/x`,x`.8`&x`&¸`.ÛÜ[Ûİ›ÚXÙ\Ë›X\
+      <div className="status-line" role="status" aria-live="polite">
+        <span className={`status-dot${busy ? " working" : ""}`} />
+        <span>{status}</span>
+        {progress !== null && <span className="progress-value">{progress}%</span>}
+      </div>
 
-›ÚXÙJHOˆÜ[ÛˆÙ^O^Ø	İ›ÚXÙK›˜[Y_KIİ›ÚXÙK›[™ßXH˜[YO^İ›ÚXÙK›˜[Y_Oİ›ÚXÙK›˜[Y_H
-İ›ÚXÙK›[™ßJOÛÜ[ÛŠ_OÜÙ[XİÛX[¸`&x`/8`%8`.¸`&x`+8`(x`'¸`-¸`%8`/¸`!8`-ø`.ˆ8`(x`&x`.ø`+x`+ø`.8`'¸`&x`+¸`.8`(x`'¸`-ˆ8`&ø`&ø`/¸`+x`&x`/¸`+ø`'¸`"¸`.ˆ8`%¸`+ø`%8`.¸`.8`cÈ^]ËTÜYXÚ8`!x`%8`!x`.¸`%x`,x`*ø`.ˆ8`&x`,8`$8`"¸`.¸`%x`*ø`$8`&¸`.¸`bÏÜÛX[Ù]ŸBˆ]ˆÛ\ÜÓ˜[YOHœ^X˜XÚËXÛÛ›ÛÈ]ÛˆÛ\ÜÓ˜[YOHœ^KX]ÛˆˆÛÛXÚÏ^Ê
-HOˆÜXZÚ[™È	‰ˆ\]\ÙYÈ
-Ú[™İËœÜYXÚŞ[\Ú\Ëœ]\ÙJ
-KÙ]]\ÙY
-YJJHˆÜXZÚ[™È	‰ˆ]\ÙYÈ
-Ú[™İËœÜYXÚŞ[\Ú\Ëœ™\İ[YJ
-KÙ]]\ÙY
-˜[ÙJJHˆÜXZÕ^
-^
-_H\ØX›Y^È]^š[J
-_OÜÜXZÚ[™È	‰ˆ\]\ÙYÈ]\ÙHÚ^™O^ÌNHš[H˜İ\œ™[ÛÛÜˆ‹Ïˆˆ^HÚ^™O^ÌNHš[H˜İ\œ™[ÛÛÜˆ‹ÏŸ^ÜÜXZÚ[™ÈÈ]\ÙYÈ¸`!¸` 8`.¸`%¸`$8`.¸`&x`&¸`.ˆˆˆ¸` x`#ø`&ø`%x`.¸`&x`&¸`.ˆˆˆ¸`(x`'¸`-¸`%8`,¸`-È8`%¸`$8`.¸`%x`/8`&x`&¸`.ˆŸOØ]Û]ÛˆÛ\ÜÓ˜[YOHœİÜX]ÛˆˆÛÛXÚÏ^ÜİÜÜYXÚH\ØX›Y^È\ÜXZÚ[™ßOÜ]X\™HÚ^™O^ÌM_Hš[H˜İ\œ™[ÛÛÜˆ‹Ïˆ8`&ø`%x`.¸`&x`&¸`.Ø]ÛÙ]‚ˆ]ˆÛ\ÜÓ˜[YOHœš]˜XŞK[›İH›Û[YVÚ^™O^ÌM_KÏÜ[ÛÛZXÈ8`%¸`+x`+ø`!8`.¸`$8`/x`,x` 8`+x`+È8`$¸`+ˆœ›İÜÙ\ˆ8`$x`,¸`&x`/¸`+8`%x`,ˆ8`%¸`$8`.¸`%x`*ø`$8`&¸`.¸`bÈÙ\™\ˆ8`%x`,x`*ø`.ˆ8`&x`$8`!8`.¸`%x`*ø`bÏÜÜ[Ù]‚ˆØ\ÚYO‚ˆÜÙXİ[Û‚‚ˆÜYÙ\Ë›[™İˆ	‰ˆÙXİ[ÛˆÛ\ÜÓ˜[YOHœYÙK\İš\]ˆÛ\ÜÓ˜[YOHœİš\ZXY[™ÈÏ¸`!x`+8`&x`.ø` 8`.¸`%8`/¸`+8`&x`.ø`+8`.ÚÏÜ[ÜYÙ\Ë›[™İHYÙ\ÏÜÜ[Ù]]ˆÛ\ÜÓ˜[YOH[X‹[\İÜYÙ\Ë›X\
+      <main className="workspace">
+        <section className="page-panel">
+          <div className="panel-heading">
+            <div>
+              <span className="section-kicker">COMIC PAGE</span>
+              <h2>{current ? current.name : "á€…á€¬á€™á€»á€€á€ºá€”á€¾á€¬"}</h2>
+            </div>
+            <span className="page-count">{pages.length ? `${active + 1} / ${pages.length}` : "0 / 0"}</span>
+          </div>
 
-YÙK[™^
-HOˆ]ÛˆÙ^O^Ø	ÜYÙK›˜[Y_KIÚ[™^XHÛ\ÜÓ˜[YO^Ø[Xˆ	ØXİ]™HOOH[™^ÈœÙ[XİYˆˆˆŸXHÛÛXÚÏ^Ê
-HOˆÛÕÊ[™^
-_O[YÈÜ˜Ï^ÜYÙK\›H[Hˆ‹ÏÜ[Ú[™^
-È_OÜÜ[Ø]ÛŠ_OÙ]ÜÙXİ[ÛŸBˆ›Ûİ\ˆÛ\ÜÓ˜[YOH™›Ûİ\ˆÜ[“VPS“PTˆRHÓÓRPÈ‘PQTÜÜ[Ü[¸`'¸`!8`-ø`.¸`!ø`+8`$8`.¸`'8`&x`.¸`.8`bˆ8`'¸`!8`-ø`.¸`(x`'¸`-¸`bˆ8`'¸`!8`-ø`.¸`!x` 8`.¸`$x`,¸`&x`/¸`+8`%x`,¸`bÏÜÜ[Ù›Ûİ\‚‚ˆÜÚİÒ[	‰ˆ]ˆÛ\ÜÓ˜[YOH›[Ù[X˜XÚÙ›ÜˆÛÛXÚÏ^Ê
-HOˆÙ]ÚİÒ[
-˜[ÙJ_OÙXİ[ÛˆÛ\ÜÓ˜[YOHš[[[Ù[ˆÛÛXÚÏ^Ê]™[
-HOˆ]™[œİÜ›ÜYØ][ÛŠ
-_O]ÛˆÛ\ÜÓ˜[YOH›[Ù[XÛÜÙHˆÛÛXÚÏ^Ê
-HOˆÙ]ÚİÒ[
-˜[ÙJ_OÚ^™O^ÌNKÏØ]ÛÜ[ˆÛ\ÜÓ˜[YOHœÙXİ[Û‹ZÚXÚÙ\ˆ”URPÒÈÕRQOÜÜ[¸`!x`$8`!8`.¸`(x`'¸`+ø`-¸`.8`%x`/8`+ø`%8`"¸`.¸`.ÚÛO¸`%¸`+ø`%8`.¸`.8`$x`,¸` ”Ë‘Ëˆ8`'¸`+x`+ø`-ø`&x`'ø`+ø`$8`.ˆĞ–ˆÛÛZXÈ8`%¸`+x`+ø`!8`.¸` 8`+x`+È8`&ø`/x`,x`.8`%x`*ø`bÏÛOO¸`!x`+8`&x`.ø` 8`.¸`%8`/¸`+8`$8`!x`.¸` x`+ø` x`.ø`!8`.¸`.8`!x`+¸`&x`/¸`+8 '8`!x`+8`'¸`+8`.8`%¸`$8`.¸`$x`+ø`$8`.¸`&x`&¸`.¸ 'H8` 8`+x`+È8`%8`/¸`+x`%x`.¸`%x`*ø`bÏÛOO¸`%¸`$8`.¸`$x`+ø`$8`.¸`$x`+8`.8`$8`,¸`-ø`!x`+8`'¸`+8`.8` 8`+x`+È8`!x`!x`.¸`%x`/8`+¸`.8 '8`(x`'¸`-¸`%8`,¸`-È8`%¸`$8`.¸`%x`/8`&x`&¸`.¸ 'H8` 8`+x`+È8`%8`/¸`+x`%x`.¸`%x`*ø`bÏÛOO¸`(x`'8`+x`+ø`(x`'8`.ø`,x`+8` 8`.¸`!¸` 8`.¸`%¸`$8`.¸`&ø`%8`.ˆÚXÚØ›Ş8` 8`+x`+È8`%¸`/x`!8`-ø`.¸`$x`+8`.8`%x`*ø`bÏÛOÛÛ¸`&x`/¸`$8`.¸` x`.ø` 8`.¸`bÈ8`&x`/8`%8`.¸`&x`+ĞÔˆ8` ÛÛZXÈÜYXÚX˜›H8`$8`/x`,x` 8`+x`+È8`(x`!x`"x`.¸`'8`+x`+ø` 8`.¸`&x`/¸`%8`.¸` 8`%8`.¸`!x`/x`+8`&x`%¸`$8`.¸`%8`+x`+ø`!8`.¸`$8`,¸`-ø`(x` x`*È8`!x`+8`'¸`+8`.8`%8`,x`&ø`+8`&x`/¸`+8` 8`+x`+ø`&¸`.¸`$8`+x`+ø`!8`.¸`%x`/8`!8`.¸`!¸`!8`.¸`%8`+x`+ø`!8`.¸`%x`*ø`$8`&¸`.¸`bÈ8`(x`'¸`-¸`&ø`&ø`/¸`+x`&x`/¸`+ø` 8`%¸`+ø`%8`.¸`.8`&ø`,¸`-ÈÈ›ÚXÙH8`%x`,x`*ø`.ˆ8`&x`,8`$8`"¸`.¸`%x`*ø`$8`&¸`.¸`bÏÜ]ÛˆÛ\ÜÓ˜[YOHœš[X\KX]Ûˆ[ˆÛÛXÚÏ^Ê
-HOˆÙ]ÚİÒ[
-˜[ÙJ_O¸`%8`+8`.8`'8`"¸`.¸`%x`*ø`%x`/8`+Ø]ÛÜÙXİ[ÛÙ]ŸBˆÛXZ[‚ˆ
-NÂŸB‚™^ÜY˜][ÛÛZXÔ™XY\Â
+          <div className={`comic-stage${current ? " has-page" : ""}`}>
+            {current ? (
+              <img key={current.url} src={current.url} alt={`á€…á€¬á€™á€»á€€á€ºá€”á€¾á€¬ ${active + 1}`} />
+            ) : (
+              <div className="empty-page">
+                <div className="empty-book"><BookOpen size={30} /></div>
+                <b>á€–á€á€ºá€…á€›á€¬ á€™á€›á€¾á€­á€á€±á€¸á€•á€«</b>
+                <span>Comic á€–á€­á€¯á€„á€ºá€á€…á€ºá€á€¯ á€›á€½á€±á€¸á€œá€­á€¯á€€á€ºá€›á€„á€º á€’á€®á€™á€¾á€¬ á€•á€±á€«á€ºá€œá€¬á€•á€«á€™á€šá€º</span>
+                <button onClick={() => fileRef.current?.click()}><FolderOpen size={14} /> á€–á€­á€¯á€„á€ºá€›á€½á€±á€¸á€™á€Šá€º</button>
+              </div>
+            )}
+          </div>
+
+          <div className="page-toolbar">
+            <button className="secondary-button" disabled={active <= 0} onClick={() => go(-1)}>
+              <ChevronLeft size={14} /> á€›á€¾á€±á€·
+            </button>
+            <span>{current ? current.name : "â€”"}</span>
+            <button className="secondary-button" disabled={!pages.length || active >= pages.length - 1} onClick={() => go(1)}>
+              á€”á€±á€¬á€€á€º <ChevronRight size={14} />
+            </button>
+          </div>
+        </section>
+
+        <section className="speech-panel">
+          <div className="panel-heading">
+            <div>
+              <span className="section-kicker">TEXT &amp; VOICE</span>
+              <h2>á€…á€¬á€á€¬á€¸ á€”á€¾á€„á€·á€º á€¡á€á€¶</h2>
+            </div>
+            <div className="voice-orb">{playing && !paused ? <Volume2 size={16} /> : <VolumeX size={16} />}</div>
+          </div>
+
+          <div className="ocr-action">
+            <div>
+              <ScanText size={20} />
+              <span><b>á€™á€¼á€”á€ºá€™á€¬ OCR</b><small>á€•á€¯á€¶á€‘á€²á€€ á€…á€¬á€á€¬á€¸á€€á€­á€¯ á€‘á€¯á€á€ºá€šá€°á€™á€Šá€º</small></span>
+            </div>
+            <button disabled={!current || busy} onClick={() => {
+              ocrCache.current.delete(active);
+              void runOcr(active);
+            }}>
+              <ScanText size={13} /> á€…á€¬á€á€¬á€¸á€‘á€¯á€á€ºá€™á€Šá€º
+            </button>
+          </div>
+
+          <div className="text-label">
+            <span>á€‘á€¯á€á€ºá€šá€°á€‘á€¬á€¸á€á€±á€¬ á€…á€¬á€á€¬á€¸</span>
+            <small>{text.length} á€œá€¯á€¶á€¸ Â· á€•á€¼á€„á€ºá€†á€„á€ºá€”á€­á€¯á€„á€ºá€á€Šá€º</small>
+          </div>
+          <textarea
+            value={text}
+            onChange={(e) => { setText(e.target.value); ocrCache.current.set(active, e.target.value); }}
+            placeholder="OCR á€œá€¯á€•á€ºá€•á€¼á€®á€¸á€›á€„á€º á€…á€¬á€á€¬á€¸á€€ á€’á€®á€™á€¾á€¬ á€•á€±á€«á€ºá€œá€¬á€•á€«á€™á€šá€ºá‹ á€€á€­á€¯á€šá€ºá€á€­á€¯á€„á€ºá€œá€Šá€ºá€¸ á€›á€­á€¯á€€á€ºá€‘á€Šá€·á€ºá€•á€¼á€„á€ºá€”á€­á€¯á€„á€ºá€•á€«á€á€šá€ºá‹"
+            spellCheck={false}
+          />
+
+          <div className="voice-options">
+            <label className="auto-next">
+              <input type="checkbox" checked={autoNext} onChange={(e) => setAutoNext(e.target.checked)} />
+              <span className="check-ui" />
+              <span>á€–á€á€ºá€•á€¼á€®á€¸á€›á€„á€º á€”á€±á€¬á€€á€ºá€…á€¬á€™á€»á€€á€ºá€”á€¾á€¬ á€¡á€œá€­á€¯á€¡á€œá€»á€±á€¬á€€á€º á€†á€€á€ºá€™á€Šá€º</span>
+            </label>
+            <button className="voice-settings" onClick={() => setShowVoice((v) => !v)}>
+              <Volume2 size={13} /> á€¡á€á€¶á€›á€½á€±á€¸á€›á€”á€º
+            </button>
+          </div>
+
+          {showVoice && (
+            <div className="voice-select-wrap">
+              <label htmlFor="voice-select">á€¡á€á€¶</label>
+              <select id="voice-select" value={voiceURI} onChange={(e) => setVoiceURI(e.target.value)}>
+                <option value="">á€™á€°á€œ (browser default)</option>
+                {voices.map((v) => (
+                  <option key={v.voiceURI} value={v.voiceURI}>{v.name} ({v.lang})</option>
+                ))}
+              </select>
+              <small>
+                {hasBurmeseVoice
+                  ? "á€™á€¼á€”á€ºá€™á€¬á€¡á€á€¶ á€á€½á€±á€·á€•á€«á€á€šá€ºá‹"
+                  : "á€’á€®á€…á€€á€ºá€™á€¾á€¬ á€™á€¼á€”á€ºá€™á€¬á€¡á€á€¶ á€™á€á€½á€±á€·á€•á€«á‹ á€–á€¯á€”á€ºá€¸/browser á€›á€²á€· text-to-speech setting á€™á€¾á€¬ á€™á€¼á€”á€ºá€™á€¬á€˜á€¬á€á€¬ á€¡á€á€¶ á€‘á€Šá€·á€ºá€á€½á€„á€ºá€¸á€•á€«á‹"}
+              </small>
+            </div>
+          )}
+
+          <div className="playback-controls">
+            <button className="play-button" disabled={!current || (busy && !playing)} onClick={togglePause}>
+              {playing && !paused ? <><Pause size={16} /> á€á€±á€á€¹á€á€›á€•á€ºá€™á€Šá€º</> : <><Play size={16} /> {paused ? "á€†á€€á€ºá€–á€á€ºá€™á€Šá€º" : "á€–á€á€ºá€•á€¼á€™á€Šá€º"}</>}
+            </button>
+            <button className="stop-button" disabled={!playing} onClick={stopSpeaking}>
+              <Square size={12} /> á€›á€•á€ºá€™á€Šá€º
+            </button>
+          </div>
+
+          <p className="privacy-note">
+            <Sparkles size={12} />
+            <span>á€–á€­á€¯á€„á€ºá€á€½á€±á€€á€­á€¯ browser á€‘á€²á€™á€¾á€¬á€•á€² á€€á€­á€¯á€„á€ºá€á€½á€šá€ºá€•á€«á€á€šá€ºá‹ OCR engine á€”á€²á€· á€˜á€¬á€á€¬á€…á€€á€¬á€¸á€’á€±á€á€¬á€€á€­á€¯á€á€¬ á€¡á€„á€ºá€á€¬á€”á€€á€ºá€€á€”á€± á€’á€±á€«á€„á€ºá€¸á€œá€¯á€’á€ºá€œá€¯á€•á€ºá€•á€«á€á€šá€ºá‹</span>
+          </p>
+        </section>
+      </main>
+
+      {pages.length > 0 && (
+        <section className="page-strip">
+          <div className="strip-heading">
+            <h3>á€…á€¬á€™á€»á€€á€ºá€”á€¾á€¬á€™á€»á€¬á€¸</h3><span>{pages.length} á€á€¯</span>
+          </div>
+          <div className="thumb-list">
+            {pages.map((p, i) => (
+              <button
+                key={p.url} className={`thumb${i === active ? " selected" : ""}`}
+                onClick={() => { if (playing) stopSpeaking(); setActive(i); }}
+                aria-label={`á€…á€¬á€™á€»á€€á€ºá€”á€¾á€¬ ${i + 1}`}
+              >
+                <img src={p.url} alt="" loading="lazy" /><span>{i + 1}</span>
+              </button>
+            ))}
+          </div>
+        </section>
+      )}
+
+      <footer className="footer">
+        <span>MYANMAR AI COMIC READER</span>
+        <span>LOCAL Â· PRIVATE Â· FREE</span>
+      </footer>
+
+      {showHelp && (
+        <div className="modal-backdrop" onClick={() => setShowHelp(false)}>
+          <div className="help-modal" role="dialog" aria-modal="true" onClick={(e) => e.stopPropagation()}>
+            <button className="modal-close" aria-label="á€•á€­á€á€ºá€™á€Šá€º" onClick={() => setShowHelp(false)}><X size={16} /></button>
+            <span className="section-kicker">HOW TO USE</span>
+            <h2>á€¡á€á€¯á€¶á€¸á€•á€¼á€¯á€”á€Šá€ºá€¸</h2>
+            <ol>
+              <li>"á€–á€­á€¯á€„á€ºá€›á€½á€±á€¸á€™á€Šá€º" á€€á€­á€¯á€”á€¾á€­á€•á€ºá€•á€¼á€®á€¸ á€•á€¯á€¶á€™á€»á€¬á€¸áŠ PDF á€á€­á€¯á€·á€™á€Ÿá€¯á€á€º CBZ á€›á€½á€±á€¸á€•á€«á‹</li>
+              <li>"á€…á€¬á€á€¬á€¸á€‘á€¯á€á€ºá€™á€Šá€º" á€€á€­á€¯á€”á€¾á€­á€•á€ºá€›á€„á€º á€•á€¯á€¶á€‘á€²á€€ á€™á€¼á€”á€ºá€™á€¬á€…á€¬á€€á€­á€¯ á€–á€á€ºá€‘á€¯á€á€ºá€•á€±á€¸á€•á€«á€™á€šá€ºá‹</li>
+              <li>á€…á€¬á€á€¬á€¸ á€™á€¾á€¬á€¸á€”á€±á€›á€„á€º á€¡á€œá€šá€ºá€€ á€¡á€€á€½á€€á€ºá€‘á€²á€™á€¾á€¬ á€á€­á€¯á€€á€ºá€›á€­á€¯á€€á€º á€•á€¼á€„á€ºá€”á€­á€¯á€„á€ºá€•á€«á€á€šá€ºá‹</li>
+              <li>"á€–á€á€ºá€•á€¼á€™á€Šá€º" á€€á€­á€¯á€”á€¾á€­á€•á€ºá€•á€¼á€®á€¸ á€¡á€á€¶á€”á€²á€· á€”á€¬á€¸á€‘á€±á€¬á€„á€ºá€•á€«á‹</li>
+            </ol>
+            <p>OCR á€›á€œá€’á€ºá€€ á€•á€¯á€¶á€›á€²á€· á€›á€¾á€„á€ºá€¸á€œá€„á€ºá€¸á€™á€¾á€¯á€•á€±á€«á€º á€™á€°á€á€Šá€ºá€•á€«á€á€šá€ºá‹ á€•á€‘á€™á€†á€¯á€¶á€¸á€¡á€€á€¼á€­á€™á€º OCR á€œá€¯á€•á€ºá€›á€„á€º á€˜á€¬á€á€¬á€…á€€á€¬á€¸á€’á€±á€á€¬ á€’á€±á€«á€„á€ºá€¸á€œá€¯á€’á€ºá€œá€¯á€•á€ºá€›á€œá€­á€¯á€· á€”á€Šá€ºá€¸á€”á€Šá€ºá€¸ á€€á€¼á€¬á€”á€­á€¯á€„á€ºá€•á€«á€á€šá€ºá‹</p>
+            <button className="primary-button full" onClick={() => setShowHelp(false)}>á€”á€¬á€¸á€œá€Šá€ºá€•á€«á€•á€¼á€®</button>
+          </div>
+        </div>
+      )}
+    </div>
+  );
+}
+
+export default ComicReader;
