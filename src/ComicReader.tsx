@@ -1,7 +1,7 @@
 import { useCallback, useEffect, useMemo, useRef, useState } from "react";
 import {
   BookOpen, ChevronLeft, ChevronRight, FileImage, FolderOpen,
-  Pause, Play, ScanText, Sparkles, Square, Volume2, VolumeX, UploadCloud, X,
+  Languages, Pause, Play, ScanText, Sparkles, Square, Volume2, VolumeX, UploadCloud, X,
 } from "lucide-react";
 import "./reader.css";
 
@@ -15,6 +15,14 @@ const CDN = {
   pdfWorker: "https://cdnjs.cloudflare.com/ajax/libs/pdf.js/3.11.174/pdf.worker.min.js",
   jszip: "https://cdnjs.cloudflare.com/ajax/libs/jszip/3.10.1/jszip.min.js",
 };
+
+const OCR_LANGS = [
+  { code: "mya", ocr: "mya+eng", label: "မြန်မာ" },
+  { code: "eng", ocr: "eng", label: "English" },
+  { code: "jpn", ocr: "jpn+jpn_vert", label: "日本語 (Manga)" },
+  { code: "kor", ocr: "kor", label: "한국어 (Manhwa)" },
+  { code: "chi_sim", ocr: "chi_sim", label: "中文 (Manhua)" },
+];
 
 const IMAGE_EXT = /\.(png|jpe?g|webp|gif|bmp|avif)$/i;
 const MIME: Record<string, string> = {
@@ -80,6 +88,10 @@ function ComicReader() {
   const [showHelp, setShowHelp] = useState(false);
   const [voices, setVoices] = useState<SpeechSynthesisVoice[]>([]);
   const [voiceURI, setVoiceURI] = useState("");
+  const [ocrLang, setOcrLang] = useState("eng");
+  const [translation, setTranslation] = useState("");
+  const [translating, setTranslating] = useState(false);
+  const [readTranslated, setReadTranslated] = useState(true);
 
   const fileRef = useRef<HTMLInputElement>(null);
   const pagesRef = useRef<ComicPage[]>([]);
@@ -90,12 +102,17 @@ function ComicReader() {
   const voiceRef = useRef("");
   const ocrCache = useRef<Map<number, string>>(new Map());
   const urlsRef = useRef<string[]>([]);
+  const ocrLangRef = useRef("eng");
+  const transCache = useRef<Map<number, string>>(new Map());
+  const readTranslatedRef = useRef(true);
 
   useEffect(() => { pagesRef.current = pages; }, [pages]);
   useEffect(() => { activeRef.current = active; }, [active]);
   useEffect(() => { textRef.current = text; }, [text]);
   useEffect(() => { autoNextRef.current = autoNext; }, [autoNext]);
   useEffect(() => { voiceRef.current = voiceURI; }, [voiceURI]);
+  useEffect(() => { ocrLangRef.current = ocrLang; }, [ocrLang]);
+  useEffect(() => { readTranslatedRef.current = readTranslated; }, [readTranslated]);
 
   // Voices
   useEffect(() => {
@@ -115,7 +132,10 @@ function ComicReader() {
   }, []);
 
   // Show cached OCR text when the page changes
-  useEffect(() => { setText(ocrCache.current.get(active) ?? ""); }, [active]);
+  useEffect(() => {
+    setText(ocrCache.current.get(active) ?? "");
+    setTranslation(transCache.current.get(active) ?? "");
+  }, [active]);
 
   // Cleanup
   useEffect(() => () => {
@@ -140,7 +160,8 @@ function ComicReader() {
     urlsRef.current.forEach((u) => URL.revokeObjectURL(u));
     urlsRef.current = [];
     ocrCache.current.clear();
-    setPages([]); setActive(0); setText("");
+    transCache.current.clear();
+    setPages([]); setActive(0); setText(""); setTranslation("");
   };
 
   const track = (blob: Blob) => {
@@ -231,12 +252,16 @@ function ComicReader() {
     setStatus(`စာမျက်နှာ ${index + 1} ကို OCR လုပ်နေသည်…`);
     try {
       if (!window.Tesseract) await loadScript(CDN.tesseract);
-      const res = await window.Tesseract.recognize(page.url, "mya+eng", {
+      const res = await window.Tesseract.recognize(
+        page.url,
+        (OCR_LANGS.find((l) => l.code === ocrLangRef.current) ?? OCR_LANGS[1]).ocr,
+        {
         logger: (m: any) => {
           if (m.status === "recognizing text") setProgress(Math.round(m.progress * 100));
           else if (m.status) setStatus(`OCR: ${m.status}`);
         },
-      });
+        },
+      );
       const clean = cleanBurmese(res?.data?.text || "");
       ocrCache.current.set(index, clean);
       if (activeRef.current === index) setText(clean);
@@ -247,6 +272,34 @@ function ComicReader() {
       return "";
     } finally {
       setBusy(false); setProgress(null);
+    }
+  }, []);
+
+  const translatePage = useCallback(async (index: number, source: string): Promise<string> => {
+    const cached = transCache.current.get(index);
+    if (cached !== undefined) return cached;
+    if (!source.trim()) return "";
+    setTranslating(true);
+    setStatus(`စာမျက်နှာ ${index + 1} ကို မြန်မာလို ဘာသာပြန်နေသည်…`);
+    try {
+      const res = await fetch("/api/translate", {
+        method: "POST",
+        headers: { "content-type": "application/json" },
+        body: JSON.stringify({ text: source, from: ocrLangRef.current }),
+      });
+      const data = await res.json().catch(() => ({}));
+      if (!res.ok || !data.translation) {
+        throw new Error(data.message || `ဘာသာပြန် server အမှား (${res.status})`);
+      }
+      transCache.current.set(index, data.translation);
+      if (activeRef.current === index) setTranslation(data.translation);
+      setStatus(`စာမျက်နှာ ${index + 1} ဘာသာပြန်ပြီးပါပြီ`);
+      return data.translation as string;
+    } catch (e: any) {
+      setStatus(`ဘာသာပြန်မရပါ: ${e?.message || "အင်တာနက်စစ်ပါ"}`);
+      return "";
+    } finally {
+      setTranslating(false);
     }
   }, []);
 
@@ -282,9 +335,15 @@ function ComicReader() {
         if (!playingRef.current) break;
         if (activeRef.current === idx) setText(t);
       }
-      if (t.trim()) {
+      let toSpeak = t;
+      if (t.trim() && readTranslatedRef.current) {
+        const tr = transCache.current.get(idx) ?? await translatePage(idx, t);
+        if (!playingRef.current) break;
+        if (tr.trim()) toSpeak = tr;
+      }
+      if (toSpeak.trim()) {
         setStatus(`စာမျက်နှာ ${idx + 1} ကို ဖတ်နေသည်…`);
-        await speak(t);
+        await speak(toSpeak);
       }
       if (!playingRef.current) break;
       if (autoNextRef.current && idx + 1 < pagesRef.current.length) {
@@ -413,10 +472,19 @@ function ComicReader() {
             </div>
             <button disabled={!current || busy} onClick={() => {
               ocrCache.current.delete(active);
+              transCache.current.delete(active);
+              setTranslation("");
               void runOcr(active);
             }}>
               <ScanText size={13} /> စာသားထုတ်မည်
             </button>
+          </div>
+
+          <div className="voice-select-wrap">
+            <label htmlFor="ocr-lang">Comic ထဲက ဘာသာစကား</label>
+            <select id="ocr-lang" value={ocrLang} onChange={(e) => setOcrLang(e.target.value)}>
+              {OCR_LANGS.map((l) => <option key={l.code} value={l.code}>{l.label}</option>)}
+            </select>
           </div>
 
           <div className="text-label">
@@ -429,6 +497,38 @@ function ComicReader() {
             placeholder="OCR လုပ်ပြီးရင် စာသားက ဒီမှာ ပေါ်လာပါမယ်။ ကိုယ်တိုင်လည်း ရိုက်ထည့်ပြင်နိုင်ပါတယ်။"
             spellCheck={false}
           />
+
+          <div className="ocr-action">
+            <div>
+              <Languages size={20} />
+              <span><b>မြန်မာ AI ဘာသာပြန်</b><small>ထုတ်ထားတဲ့ စာသားကို မြန်မာလို ပြန်မည်</small></span>
+            </div>
+            <button disabled={!text.trim() || busy || translating} onClick={() => {
+              transCache.current.delete(active);
+              void translatePage(active, text);
+            }}>
+              <Languages size={13} /> {translating ? "ပြန်နေသည်…" : "ဘာသာပြန်မည်"}
+            </button>
+          </div>
+
+          <div className="text-label">
+            <span>မြန်မာဘာသာပြန်</span>
+            <small>{translation.length} လုံး · ပြင်ဆင်နိုင်သည်</small>
+          </div>
+          <textarea
+            value={translation}
+            onChange={(e) => { setTranslation(e.target.value); transCache.current.set(active, e.target.value); }}
+            placeholder="ဘာသာပြန်ပြီးရင် မြန်မာစာသားက ဒီမှာ ပေါ်လာပါမယ်။"
+            spellCheck={false}
+          />
+
+          <div className="voice-options">
+            <label className="auto-next">
+              <input type="checkbox" checked={readTranslated} onChange={(e) => setReadTranslated(e.target.checked)} />
+              <span className="check-ui" />
+              <span>ဖတ်ပြတဲ့အခါ မြန်မာဘာသာပြန်ကို သုံးမည်</span>
+            </label>
+          </div>
 
           <div className="voice-options">
             <label className="auto-next">
@@ -508,6 +608,7 @@ function ComicReader() {
               <li>"ဖိုင်ရွေးမည်" ကိုနှိပ်ပြီး ပုံများ၊ PDF သို့မဟုတ် CBZ ရွေးပါ။</li>
               <li>"စာသားထုတ်မည်" ကိုနှိပ်ရင် ပုံထဲက မြန်မာစာကို ဖတ်ထုတ်ပေးပါမယ်။</li>
               <li>စာသား မှားနေရင် အလယ်က အကွက်ထဲမှာ တိုက်ရိုက် ပြင်နိုင်ပါတယ်။</li>
+              <li>"ဘာသာပြန်မည်" ကိုနှိပ်ရင် AI က မြန်မာလို ပြန်ပေးပါမယ်။</li>
               <li>"ဖတ်ပြမည်" ကိုနှိပ်ပြီး အသံနဲ့ နားထောင်ပါ။</li>
             </ol>
             <p>OCR ရလဒ်က ပုံရဲ့ ရှင်းလင်းမှုပေါ် မူတည်ပါတယ်။ ပထမဆုံးအကြိမ် OCR လုပ်ရင် ဘာသာစကားဒေတာ ဒေါင်းလုဒ်လုပ်ရလို့ နည်းနည်း ကြာနိုင်ပါတယ်။</p>
